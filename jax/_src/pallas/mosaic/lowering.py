@@ -29,6 +29,7 @@ from jax import lax
 from jax import tree_util
 from jax._src import ad_util
 from jax._src import checkify
+from jax._src import config
 from jax._src import core as jax_core
 from jax._src import custom_derivatives
 from jax._src import debugging
@@ -61,7 +62,6 @@ from jax._src.lib.mlir.dialects import scf
 from jax._src.lib.mlir.dialects import vector
 from jax._src.pallas import core as pallas_core
 from jax._src.pallas import helpers as pallas_helpers
-from jax._src.pallas import pallas_call
 from jax._src.pallas import primitives
 from jax._src.pallas import utils as pallas_utils
 from jax._src.pallas.mosaic import core as tpu_core
@@ -186,7 +186,6 @@ class LoweringContext:
   mesh_context: pallas_utils.MeshInfo | None
   kernel_type: tpu_core.KernelType
   traceback_caches: mlir.TracebackCaches
-  for_verification: bool
   forward_compatible: bool
   backend: xla_bridge.XlaBackend | None
   dynamic_shape_replacement_fn: DynamicShapeReplacementFn
@@ -704,9 +703,9 @@ def _check_block_mappings(
     else:
       assert rank == 1
       if bm.array_aval.dtype == jnp.bool_:
-        bitwidth = dtypes.bit_width(BOOL_MEMREF_TYPE)
+        bitwidth = dtypes.itemsize_bits(BOOL_MEMREF_TYPE)
       else:
-        bitwidth = dtypes.bit_width(physical_dtype)
+        bitwidth = dtypes.itemsize_bits(physical_dtype)
       packing = 32 // bitwidth
       tiling_size = 128 * packing
       evenly_divisible = (bs0 == as0 or bs0 % tiling_size == 0)
@@ -717,7 +716,7 @@ def _check_block_mappings(
             " shape is equal to the first (and only) dimension of the array"
             " shape, or 2) the first (and only) dimension of the block shape"
             f" is a multiple of the tiling size ({tiling_size} = 128 * (32 //"
-            f" {dtypes.bit_width(physical_dtype)})) of the"
+            f" {dtypes.itemsize_bits(physical_dtype)})) of the"
             " array shape. "
             + err_details()
         )
@@ -731,7 +730,6 @@ def lower_jaxpr_to_module(
     dimension_semantics: Sequence[tpu_core.DimensionSemantics] | None,
     kernel_type: tpu_core.KernelType,
     mesh: mesh_lib.Mesh | None = None,
-    for_verification: bool = False,
     dynamic_shape_replacement_enabled: bool = False,
 ) -> ir.Module:
   backend = lowering_context.module_context.get_backend(optional=True)
@@ -782,7 +780,6 @@ def lower_jaxpr_to_module(
       mosaic_grid_mapping=mosaic_grid_mapping,
       name="main",
       kernel_type=kernel_type,
-      for_verification=for_verification,
       forward_compatible=lowering_context.is_forward_compat(),
       dynamic_shape_replacement_fn=dynamic_shape_replacement_fn,
       dynamic_shape_replacement_enabled=dynamic_shape_replacement_enabled,
@@ -820,7 +817,6 @@ def lower_jaxpr_to_module(
           name=func_name,
           mosaic_grid_mapping=mosaic_grid_mapping,
           kernel_type=kernel_type,
-          for_verification=for_verification,
           forward_compatible=lowering_context.is_forward_compat(),
           dynamic_shape_replacement_fn=dynamic_shape_replacement_fn,
           backend=backend,
@@ -975,7 +971,6 @@ def lower_jaxpr_to_transform_func(
     name: str,
     mosaic_grid_mapping: MosaicGridMapping,
     kernel_type: tpu_core.KernelType,
-    for_verification: bool,
     forward_compatible: bool,
     backend: Any | None,
     dynamic_shape_replacement_fn: DynamicShapeReplacementFn | None = None,
@@ -1005,7 +1000,6 @@ def lower_jaxpr_to_transform_func(
         mesh_context=mosaic_grid_mapping.mesh_info,
         kernel_type=kernel_type,
         traceback_caches=mlir.TracebackCaches(),
-        for_verification=for_verification,
         forward_compatible=forward_compatible,
         backend=backend,
         dynamic_shape_replacement_fn=dynamic_shape_replacement_fn,
@@ -1035,7 +1029,6 @@ def lower_jaxpr_to_func(
     mosaic_grid_mapping: MosaicGridMapping,
     name: str,
     kernel_type: tpu_core.KernelType,
-    for_verification: bool,
     forward_compatible: bool,
     backend: Any | None,
     dynamic_shape_replacement_fn: DynamicShapeReplacementFn | None = None,
@@ -1070,7 +1063,6 @@ def lower_jaxpr_to_func(
         mesh_context=mosaic_grid_mapping.mesh_info,
         kernel_type=kernel_type,
         traceback_caches=mlir.TracebackCaches(),
-        for_verification=for_verification,
         forward_compatible=forward_compatible,
         backend=backend,
         dynamic_shape_replacement_fn=dynamic_shape_replacement_fn,
@@ -1208,7 +1200,7 @@ def jaxpr_subcomp(
         except LoweringException:
           raise  # We only add the extra info to the innermost exception.
         except Exception as e:
-          if not pallas_call._verbose_errors_enabled():
+          if not config.jax_pallas_verbose_errors.value:
             raise
           msg = (f"{type(e).__name__}: {e}\n" +
                 "Additional diagnostics: \n" +
@@ -1482,8 +1474,8 @@ def _bitcast_memref(
     ref_dtype: DTypeLike,
     ref_block_shape: tuple[int | pallas_core.Squeezed, ...],
 ) -> tuple[ir.Value, DTypeLike, tuple[int | pallas_core.Squeezed, ...]]:
-  src_bitwidth = dtypes.bit_width(ref_dtype)
-  dst_bitwidth = dtypes.bit_width(bitcaster.dtype)
+  src_bitwidth = dtypes.itemsize_bits(ref_dtype)
+  dst_bitwidth = dtypes.itemsize_bits(bitcaster.dtype)
   if src_bitwidth != dst_bitwidth:
     if len(ref_block_shape) < 2:
       raise NotImplementedError(
@@ -2306,8 +2298,8 @@ def _dot_general_lowering_rule(
 def _convert_helper(x: Array, *, to_dtype: jnp.dtype) -> Array:
   # Helper function for dtype conversion
   from_dtype = x.dtype
-  from_bitwidth = dtypes.bit_width(from_dtype)
-  to_bitwidth = dtypes.bit_width(to_dtype)
+  from_bitwidth = dtypes.itemsize_bits(from_dtype)
+  to_bitwidth = dtypes.itemsize_bits(to_dtype)
   if from_dtype == jnp.bool_:
     x = x.astype(jnp.int32)
     return _convert_helper(x, to_dtype=to_dtype)
@@ -2363,8 +2355,8 @@ def _convert_element_type_lowering_rule(
   integer = jnp.integer
   signed = jnp.signedinteger
   unsigned = jnp.unsignedinteger
-  old_bitwidth = dtypes.bit_width(old_dtype)
-  new_bitwidth = dtypes.bit_width(new_dtype)
+  old_bitwidth = dtypes.itemsize_bits(old_dtype)
+  new_bitwidth = dtypes.itemsize_bits(new_dtype)
   both_32bit = old_bitwidth == 32 and new_bitwidth == 32
   if _from(floating) and _to(floating):
     forward_compat = ctx.forward_compatible or ctx.is_cloud_tpu_older_than(
@@ -2690,16 +2682,32 @@ def _reduce_index_helper(
     ctx: LoweringRuleContext, x, axes, index_dtype, reduction_kind):
   (x_aval,) = ctx.avals_in
   (out_aval,) = ctx.avals_out
-  out_type = aval_to_ir_type(
-      ctx.lowering_context.dynamic_shape_replacement_fn, out_aval
-  )
   if x_aval.dtype != jnp.float32:
     raise NotImplementedError("Only float32 is supported")
   if len(axes) != 1:
     raise NotImplementedError("Only single axis reduction supported")
   if index_dtype != jnp.int32:
     raise NotImplementedError("Only index_dtype=int32 is supported")
-  return tpu.reduce_index(out_type, x, axes[0], reduction_kind)
+
+  axis = axes[0]
+  # TODO(b/460843515): Support 1D inputs in Mosaic.
+  is_1d = len(x_aval.shape) == 1
+  if is_1d:
+    x_2d_aval = jax_core.ShapedArray((1, *x_aval.shape), x_aval.dtype)
+    x_2d_type = aval_to_ir_type(
+        ctx.lowering_context.dynamic_shape_replacement_fn, x_2d_aval
+    )
+    out_aval = jax_core.ShapedArray((1, *out_aval.shape), out_aval.dtype)
+    x = vector.shape_cast(x_2d_type, x)
+    axis += 1
+
+  out_type = aval_to_ir_type(
+      ctx.lowering_context.dynamic_shape_replacement_fn, out_aval
+  )
+  result = tpu.reduce_index(out_type, x, axis, reduction_kind)
+  if is_1d:
+    return vector.extract(result, [], [0])
+  return result
 
 @register_lowering_rule(lax.argmax_p, ensure_mlir_values=False)
 def _argmax_lowering_rule(ctx: LoweringRuleContext, x, axes, index_dtype):
@@ -2826,7 +2834,7 @@ def _square_lowering_rule(ctx: LoweringRuleContext, x):
   return arith.mulf(x, x)
 
 
-@register_lowering_rule(lax.exp_p)
+@register_lowering_rule(lax.exp_p, kernel_types=[*tpu_core.KernelType])
 def _exp_lowering_rule(ctx: LoweringRuleContext, x, accuracy):
   if accuracy is not None:
     raise NotImplementedError("Not implemented: accuracy")
@@ -3527,7 +3535,11 @@ def _shift_left_lowering_rule(ctx: LoweringRuleContext, x, d):
   return arith.shli(x, d)
 
 
-@register_lowering_rule(lax.shift_right_arithmetic_p, ensure_mlir_values=False)
+@register_lowering_rule(
+    lax.shift_right_arithmetic_p,
+    kernel_types=[*tpu_core.KernelType],
+    ensure_mlir_values=False,
+)
 def _shift_right_arithmetic_lowering_rule(ctx: LoweringRuleContext, x, d):
   x, d = _bcast(x, d, *ctx.avals_in, *ctx.avals_out)
   return arith.shrsi(x, d)
@@ -3639,8 +3651,8 @@ def _bitcast_convert_type_lowering_rule(
 ):
   (in_aval, ) = ctx.avals_in
   (out_aval,) = ctx.avals_out
-  old_bitwidth = dtypes.bit_width(in_aval.dtype)
-  new_bitwidth = dtypes.bit_width(new_dtype)
+  old_bitwidth = dtypes.itemsize_bits(in_aval.dtype)
+  new_bitwidth = dtypes.itemsize_bits(new_dtype)
   if old_bitwidth != new_bitwidth:
     raise NotImplementedError("Changing bitwidths not supported.")
   return tpu.bitcast(
@@ -3939,6 +3951,7 @@ def _debug_print_rule(
     static_args,
     np_printoptions,
     has_placeholders,
+    logging_record,
 ):
   del partitioned, np_printoptions
   if ordered:

@@ -1405,6 +1405,35 @@ class JaxExportTest(jtu.JaxTestCase):
         f"context with {jax.local_device_count()} devices"):
       exp.call(b)
 
+  def test_memory_space(self):
+    shd = jax.sharding.SingleDeviceSharding(
+        jax.devices()[0], memory_kind="pinned_host")
+    a = jax.device_put(1, shd)
+    f = jax.jit(lambda x: x)
+
+    exported = get_exported(f, platforms=("tpu", "cuda"))(a)
+    self.assertEqual(exported.in_avals[0].memory_space, core.MemorySpace.Host)
+    self.assertEqual(exported.out_avals[0].memory_space, core.MemorySpace.Host)
+    if jtu.device_under_test() in ("tpu", "gpu"):
+      b = exported.call(a)
+      self.assertEqual(b.sharding, a.sharding)
+
+  def test_memory_space_from_out_shardings(self):
+    shd = jax.sharding.SingleDeviceSharding(
+        jax.devices()[0], memory_kind="pinned_host")
+    a = jax.device_put(1, shd)
+    f = jax.jit(lambda x: (x, jnp.ones((2, 2), dtype=np.float32)),
+                out_shardings=(shd, shd))
+
+    exported = get_exported(f, platforms=("tpu", "cuda"))(a)
+    self.assertEqual(exported.in_avals[0].memory_space, core.MemorySpace.Host)
+    self.assertEqual(exported.out_avals[0].memory_space, core.MemorySpace.Host)
+    self.assertEqual(exported.out_avals[1].memory_space, core.MemorySpace.Host)
+    if jtu.device_under_test() in ("tpu", "gpu"):
+      b, c = exported.call(a)
+      self.assertEqual(b.sharding, shd)
+      self.assertEqual(c.sharding, shd)
+
   @jtu.parameterized_filterable(
     kwargs=[
       dict(testcase_name=f"_poly={poly}", poly=poly)

@@ -13,24 +13,27 @@
 # limitations under the License.
 """Lowering for Pallas TPU SparseCore."""
 
+from typing import Any, NoReturn, cast
 from collections.abc import Sequence
 import contextlib
 import dataclasses
 import functools
-from typing import Any, NoReturn, cast
 
-import jax
 from jax._src import api_util
 from jax._src import core as jax_core
 from jax._src import debugging
+from jax._src import lax
 from jax._src import linear_util as lu
 from jax._src import mesh as mesh_lib
+from jax._src import numpy as jnp
 from jax._src import source_info_util
 from jax._src import state
 from jax._src import util
+from jax._src import tree_util
 from jax._src.interpreters import mlir
 from jax._src.interpreters import partial_eval as pe
 from jax._src.lib.mlir import ir
+from jax._src.lib.mlir.dialects import arith
 from jax._src.lib.mlir.dialects import func
 from jax._src.lib.mlir.dialects import memref
 from jax._src.pallas import core as pallas_core
@@ -43,7 +46,6 @@ from jax._src.state import discharge as state_discharge
 from jax._src.state import indexing
 from jax._src.state import primitives as state_primitives
 from jax.experimental.mosaic.dialects import tpu
-import jax.numpy as jnp
 
 
 map, unsafe_map = util.safe_map, map
@@ -97,15 +99,21 @@ def dynamic_shape_replacement_fn(x):
 
 def lower_jaxpr_to_module(
     lowering_context: mlir.LoweringRuleContext,
-    jaxpr: jax_core.Jaxpr,
     grid_mapping: pallas_core.GridMapping,
-    mosaic_params: tpu_core.CompilerParams,
+    jaxpr: jax_core.Jaxpr,
+    *,
+    dimension_semantics: Sequence[tpu_core.DimensionSemantics] | None,
+    kernel_type: tpu_core.KernelType,
     mesh: mesh_lib.Mesh | None = None,
+    dynamic_shape_replacement_enabled: bool = False,
 ) -> ir.Module:
   """Lowers a Jaxpr to a Mosaic SparseCore module."""
-  dimension_semantics = mosaic_params.dimension_semantics
+  if dynamic_shape_replacement_enabled:
+    raise NotImplementedError(
+        "Dynamic shape replacement is not supported for SparseCore."
+    )
   if not grid_mapping.grid:
-    index_map_avals, index_map_tree = jax.tree.flatten(
+    index_map_avals, index_map_tree = tree_util.tree_flatten(
         ((jax_core.ShapedArray((), jnp.int32),), {})
     )
     if grid_mapping.num_index_operands:
@@ -167,7 +175,7 @@ def lower_jaxpr_to_module(
   func_op = lower_jaxpr_to_func(
       jaxpr,
       name="main",
-      kernel_type=mosaic_params.kernel_type,
+      kernel_type=kernel_type,
       mosaic_grid_mapping=mosaic_grid_mapping,
       forward_compatible=lowering_context.is_forward_compat(),
       backend=backend,
@@ -188,8 +196,7 @@ def lower_jaxpr_to_module(
         bm.block_aval,
         name=func_name,
         mosaic_grid_mapping=mosaic_grid_mapping,
-        kernel_type=mosaic_params.kernel_type,
-        for_verification=False,
+        kernel_type=kernel_type,
         forward_compatible=lowering_context.is_forward_compat(),
         backend=backend,
     )
@@ -284,7 +291,7 @@ def lower_jaxpr_to_func(
     )
 
     allocations = sc_core.gather_global_allocations(jaxpr)
-    flat_allocations, allocations_tree = jax.tree.flatten(allocations)
+    flat_allocations, allocations_tree = tree_util.tree_flatten(allocations)
     allocation_operands = operands_and_scratch[
         len(operands_and_scratch) - len(flat_allocations):]
     allocations = allocations_tree.unflatten(allocation_operands)
@@ -298,7 +305,6 @@ def lower_jaxpr_to_func(
         mesh_context=mosaic_grid_mapping.mesh_info,
         traceback_caches=mlir.TracebackCaches(),
         kernel_type=kernel_type,
-        for_verification=False,
         forward_compatible=forward_compatible,
         backend=backend,
         dynamic_shape_replacement_fn=dynamic_shape_replacement_fn,
@@ -381,7 +387,7 @@ def _load_lowering_rule(
         " via `pltpu.async_copy`."
     )
 
-  transforms = list(jax.tree.unflatten(tree, flat_transforms))
+  transforms = list(tree_util.tree_unflatten(tree, flat_transforms))
   if not transforms or not isinstance(transforms[-1], indexing.NDIndexer):
     ref_shape = state.get_transforms_shape(transforms, ref_aval.shape)
     transforms.append(indexing.NDIndexer.make_trivial_indexer(ref_shape))
@@ -442,7 +448,7 @@ def _store_lowering_rule(
         " via `pltpu.async_copy`."
     )
 
-  transforms = list(jax.tree.unflatten(tree, flat_transforms))
+  transforms = list(tree_util.tree_unflatten(tree, flat_transforms))
   if not transforms or not isinstance(transforms[-1], indexing.NDIndexer):
     ref_shape = state.get_transforms_shape(transforms, ref_aval.shape)
     transforms.append(indexing.NDIndexer.make_trivial_indexer(ref_shape))
@@ -484,7 +490,7 @@ def _store_lowering_rule(
   return old_val
 
 
-@register_lowering_rule(jax.lax.iota_p,
+@register_lowering_rule(lax.iota_p,
                         kernel_types=[tpu_core.KernelType.SC_VECTOR_SUBCORE])
 def _iota_lowering_rule_sc(ctx: LoweringRuleContext, dtype, shape, dimension,
                            sharding):
@@ -527,6 +533,7 @@ def _debug_print_lowering_rule(
     static_args,
     np_printoptions,
     has_placeholders,
+    logging_record,
 ):
   del partitioned, np_printoptions, in_tree, static_args
   def fail(reason: str) -> NoReturn:
@@ -854,6 +861,47 @@ def _run_scoped_lowering_rule(
       collective_axes=collective_axes,
       alloc_fn=_alloc_value,
   )
+
+
+@register_lowering_rule(
+    lax.sort_p, kernel_types=[tpu_core.KernelType.SC_VECTOR_SUBCORE]
+)
+def _sort_lowering_rule(
+    ctx: LoweringRuleContext, *xs, dimension, is_stable, num_keys
+):
+  del is_stable  # Unused, always stable.
+  if dimension not in (0, -1):
+    raise ValueError(f"Unsupported dimension: {dimension}")
+  if num_keys != 1:
+    raise NotImplementedError("Multiple sort keys not supported")
+  sc_info = sc_core.get_sparse_core_info()
+  supported_shape = (sc_info.num_lanes,)
+  for i, aval in enumerate(ctx.avals_in):
+    if aval.shape != supported_shape:
+      raise NotImplementedError(
+          f"Unsupported shape for operand {i} of SC sort: Got {aval.shape}, "
+          f"expected {supported_shape}"
+      )
+  keys = xs[0]
+  values = xs[1:]
+  mask_type = ir.VectorType.get(
+      [sc_info.num_lanes], ir.IntegerType.get_signless(1))
+  mask = arith.constant(mask_type, ir.DenseElementsAttr.get_splat(
+      mask_type, ir.BoolAttr.get(True)))
+  if not values:
+    _, sorted_keys, _ = tpu.sort(
+        mask_type, keys.type, keys.type, keys, keys, mask=mask
+    )
+    return (sorted_keys,)
+  results: list[ir.Value] = []
+  for value in values:
+    _, sorted_keys, sorted_value = tpu.sort(
+        mask_type, keys.type, value.type, keys, value, mask=mask
+    )
+    if not results:
+      results.append(sorted_keys)
+    results.append(sorted_value)
+  return tuple(results)
 
 
 def _default_tile_strides(

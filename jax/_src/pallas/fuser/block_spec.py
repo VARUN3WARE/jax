@@ -296,6 +296,34 @@ def pull_block_spec(
   return wrapped
 
 
+def _block_dim_equal(
+    b1: int | pallas_core.BlockDim | None, b2: int | pallas_core.BlockDim | None
+) -> bool:
+  block_size1 = pallas_core.get_block_size(b1)
+  block_size2 = pallas_core.get_block_size(b2)
+  match (b1, b2):
+    case (None, _) | (_, None):
+      return b1 == b2
+    case (
+        (pallas_core.Blocked(), int())
+        | (int(), pallas_core.Blocked())
+        | (pallas_core.Blocked(), pallas_core.Blocked())
+        | (int(), int())
+    ):
+      return block_size1 == block_size2
+    case _:
+      return type(b1) == type(b2) and (block_size1 == block_size2)
+
+
+def _block_shapes_equal(
+    bs1: tuple[int | pallas_core.BlockDim | None] | None,
+    bs2: tuple[int | pallas_core.BlockDim | None] | None,
+) -> bool:
+  if bs1 is None or bs2 is None:
+    return bs1 == bs2
+  return all(_block_dim_equal(b1, b2) for b1, b2 in zip(bs1, bs2))
+
+
 def _pull_block_spec(
     jaxpr: core.Jaxpr,
     out_block_specs: tuple[pallas_core.BlockSpec, ...],
@@ -393,7 +421,8 @@ def _pull_block_spec(
       if (
           not isinstance(v, core.Literal)
           and v in env
-          and env[v].block_shape != in_block_spec.block_shape
+          and not _block_shapes_equal(env[v].block_shape,
+                                      in_block_spec.block_shape)
       ):
         in_block_spec = pallas_core.BlockSpec(_illegal, _illegal)  # pytype: disable=wrong-arg-types
       _write_block_spec(v, in_block_spec)
@@ -436,7 +465,6 @@ def make_kernel_function(
   def _remove_nones(
       shape: tuple[pallas_core.BlockDim | int | None, ...] | None,
   ) -> tuple[int, ...]:
-    assert shape is not None
     new_shape = tuple(_block_size(s) for s in shape)
     return tuple(s for s in new_shape if s is not None)
 
@@ -690,7 +718,7 @@ def _eltwise_usage_rule(
   return [used_out]
 
 
-def _bcast_block_spec(
+def _pull_bcast_block_spec(
     block_spec: pallas_core.BlockSpec, i: int
 ) -> pallas_core.BlockSpec:
   def new_index_map(*args):
@@ -711,6 +739,21 @@ def _bcast_block_spec(
       block_spec.block_shape, i, bcast_dim_block_shape
   )
   return pallas_core.BlockSpec(new_block_shape, new_index_map)
+
+
+def _push_bcast_block_spec(
+    block_spec: pallas_core.BlockSpec,
+    i: int,
+    size: int,
+) -> pallas_core.BlockSpec:
+
+  bcast_dim_block_shape = size
+  if isinstance(block_spec.block_shape[i], pallas_core.Element):
+    bcast_dim_block_shape = pallas_core.Element(size)
+  new_block_shape = util.tuple_update(  # pytype: disable=wrong-arg-types
+      block_spec.block_shape, i, bcast_dim_block_shape
+  )
+  return pallas_core.BlockSpec(new_block_shape, block_spec.index_map)
 
 
 def _binop_usage_rule(prim, ctx, used_out: set[Usage]):
@@ -754,9 +797,9 @@ def _binop_pull_rule(prim, ctx: PullRuleContext, block_spec):
       zip(left_aval.shape, right_aval.shape, strict=True)
   ):
     if l == 1 and r != 1:
-      l_block_spec = _bcast_block_spec(l_block_spec, i)
+      l_block_spec = _pull_bcast_block_spec(l_block_spec, i)
     if r == 1 and l != 1:
-      r_block_spec = _bcast_block_spec(r_block_spec, i)
+      r_block_spec = _pull_bcast_block_spec(r_block_spec, i)
 
   return [l_block_spec, r_block_spec]
 
@@ -1959,16 +2002,13 @@ def _custom_vjp_call_pull_block_spec_rule(
 def _custom_call_hi_primitive_pull_block_spec_rule(
     ctx: PullRuleContext, out_block_specs, *, prim
 ):
-  del ctx
-  return prim.pull_block_spec_rule(out_block_specs)
-
+  return prim.pull_block_spec_rule(ctx, out_block_specs)
 
 @register_eval_rule(hijax.call_hi_primitive_p)
 def _custom_call_hi_primitive_eval_rule(
-    ctx: KernelEvalContext, x, *, prim
+    ctx: KernelEvalContext, *args, prim
 ):
-  del ctx
-  return prim.expand(x)
+  return jax.tree.leaves(prim.block_eval_rule(ctx, *args))
 
 
 @functools.partial(api_boundary, repro_api_name="fuser.push_block_spec")
@@ -2092,6 +2132,23 @@ def _binop_push_rule(
   left_aval, right_aval = ctx.avals_in
   assert isinstance(left_aval, core.ShapedArray)
   assert isinstance(right_aval, core.ShapedArray)
+  if not right_aval.shape:
+    return left_block_spec
+  if not left_aval.shape:
+    return right_block_spec
+  lhs_has_block_spec = left_block_spec is not pallas_core.no_block_spec
+  rhs_has_block_spec = right_block_spec is not pallas_core.no_block_spec
+  if not (lhs_has_block_spec ^ rhs_has_block_spec):
+    # We can only do a push if one of the block specs is unspecified
+    # or they are identical.
+    if left_block_spec is right_block_spec:
+      return left_block_spec
+    raise ValueError('Illegal binary push. One of the block specs must be no_block_spec.')
+  for l, r in zip(left_aval.shape, right_aval.shape, strict=True):
+    if l == 1 and r != 1 and lhs_has_block_spec:
+      raise ValueError('Cannot propagate block spec through LHS broadcast.')
+    if r == 1 and l != 1 and rhs_has_block_spec:
+      raise ValueError('Cannot propagate block spec through RHS broadcast.')
   if left_block_spec is pallas_core.no_block_spec:
     return right_block_spec
   if right_block_spec is pallas_core.no_block_spec:
@@ -2136,7 +2193,7 @@ def _transpose_push_rule(
 ) -> pallas_core.BlockSpec:
   del ctx
   block_shape = block_spec.block_shape
-  new_shape = [block_shape[i] for i in permutation]
+  new_shape = tuple(block_shape[i] for i in permutation)
   if set(permutation[-2:]) != {permutation[-1], permutation[-2]}:
     raise NotImplementedError(
         'Cannot permute last two dimensions with leading dimensions.'
@@ -2201,6 +2258,12 @@ def _custom_vjp_call_push_rule(
   del ctx, num_consts, fwd_jaxpr_thunk, bwd, out_trees, symbolic_zeros
   return _push_block_spec_jaxpr(call_jaxpr.jaxpr, *block_specs)
 
+@register_push_block_spec_rule(hijax.call_hi_primitive_p)
+def _custom_call_hi_primitive_push_block_spec_rule(
+    ctx: PullRuleContext, *block_specs, prim
+):
+  return prim.push_block_spec_rule(ctx, block_specs)
+
 
 @register_push_block_spec_rule(pjit.jit_p)
 def _pjit_push_rule(ctx, *block_specs, jaxpr: core.ClosedJaxpr, **_):
@@ -2225,6 +2288,7 @@ register_eltwise_rule(lax.sin_p)
 register_eltwise_rule(lax.cos_p)
 register_eltwise_rule(lax.sqrt_p)
 register_eltwise_rule(lax.rsqrt_p)
+register_eltwise_rule(lax.square_p)
 register_eltwise_rule(lax.log_p)
 register_eltwise_rule(lax.integer_pow_p)
 
@@ -2342,3 +2406,55 @@ def _broadcast_in_dim_push_rule(
     )
 
   return pallas_core.BlockSpec(tuple(new_block_shape), new_index_map)
+
+
+@register_push_block_spec_rule(lax.concatenate_p)
+def _concatenate_push_rule(
+    ctx: PushRuleContext,
+    *block_specs: pallas_core.BlockSpec,
+    dimension: int,
+):
+  avals_in = ctx.avals_in
+  block_shapes = [
+      pallas_core._canonicalize_block_shape(block_spec.block_shape)
+      for block_spec in block_specs
+  ]
+  # We only support concatenation if the entirety of the concat dimension is blocked.
+  assert all(hasattr(aval_in, 'shape') for aval_in in avals_in)
+  if not all(
+      block_shape[dimension] == pallas_core.Blocked(avals_in.shape[dimension])  # pytype: disable=attribute-error
+      for block_shape, avals_in in zip(block_shapes, avals_in)
+  ):
+    raise NotImplementedError(
+        f'concatenate not supported yet: {block_shapes=}, {avals_in=}'
+    )
+  def _new_index_map(*args):
+    all_indices = [block_spec.index_map(*args) for block_spec in block_specs]
+    # This is a very important check. We cannot actually construct a single BlockSpec
+    # for the output of concatenate if the indices are not identical across all the
+    # inputs. This is not something we can always enforce statically, but to be conservative
+    # we apply a very aggressive check. We can consider relaxing this later.
+    if not all(
+        (all_indices[0][i] is all_indices[j][i])
+        for i in range(len(all_indices[0]))
+        for j in range(len(all_indices))
+    ):
+      raise ValueError(
+          'Cannot statically prove that all input blocks to concatenate are the'
+          ' same.'
+      )
+    # If all block indices are the same, we are materializing the full concatenation along
+    # the concat dimension, so we use index 0.
+    base_indices = list(all_indices[0])
+    base_indices[dimension] = 0
+    return tuple(base_indices)
+
+  new_block_shape = list(block_specs[0].block_shape)
+  # Since the entirety of the concat dimension is materialized in the blocks,
+  # the new block size is the sum of the block sizes of the inputs along that
+  # dimension.
+  new_block_shape[dimension] = sum(
+      pallas_core.get_block_size(block_shape[dimension])
+      for block_shape in block_shapes
+  )
+  return pallas_core.BlockSpec(tuple(new_block_shape), _new_index_map)

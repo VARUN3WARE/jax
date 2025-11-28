@@ -422,6 +422,8 @@ def gather(operand: ArrayLike, start_indices: ArrayLike,
         fill_value = dtypes.iinfo(dtype).max
       elif dtype == dtypes.bool_:
         fill_value = True
+      elif dtypes.issubdtype(dtype, dtypes.prng_key):
+        fill_value = np.iinfo('uint32').max
       else:
         raise ValueError(f"Unsupported dtype for gather fill_value {dtype}")
   else:
@@ -1540,6 +1542,10 @@ def _dynamic_slice_sharding_rule(operand, *starts_and_dyn_sizes, slice_sizes):
       operand, *starts_and_dyn_sizes, slice_sizes=slice_sizes)
   return _get_sharding_for_varying_out_shape(out_shape, operand, 'dynamic_slice')
 
+def _dynamic_slice_reduced_rule(out_s, operand, *starts_and_dyn_sizes,
+                                slice_sizes):
+  return out_s.update(spec=out_s.spec.update(
+      reduced=operand.sharding.spec.reduced))
 
 def _dynamic_slice_dtype_rule(operand, *starts_and_dyn_sizes, slice_sizes):
   start_indices, dyn = util.split_list(starts_and_dyn_sizes, [operand.ndim])
@@ -1661,7 +1667,8 @@ dynamic_slice_p = standard_primitive(
     _dynamic_slice_shape_rule, _dynamic_slice_dtype_rule, 'dynamic_slice',
     weak_type_rule=_argnum_weak_type(0),
     sharding_rule=_dynamic_slice_sharding_rule,
-    vma_rule=partial(core.standard_vma_rule, 'dynamic_slice'))
+    vma_rule=partial(core.standard_vma_rule, 'dynamic_slice'),
+    reduced_rule=_dynamic_slice_reduced_rule)
 ad.primitive_jvps[dynamic_slice_p] = _dynamic_slice_jvp
 ad.primitive_transposes[dynamic_slice_p] = _dynamic_slice_transpose_rule
 ad.fancy_transposes[dynamic_slice_p] = _dynamic_slice_transpose_fancy
@@ -1716,7 +1723,18 @@ def _dynamic_update_slice_unreduced_rule(out_s, operand, update, *start_indices)
         " same axes. Got operand sharding"
         f" {operand.str_short(mesh_axis_types=True)} and update sharding"
         f" {update.str_short(mesh_axis_types=True)}.")
-  return out_s
+  return out_s.update(spec=out_s.spec.update(
+      unreduced=operand.sharding.spec.unreduced))
+
+def _dynamic_update_slice_reduced_rule(out_s, operand, update, *start_indices):
+  if operand.sharding.spec.reduced != update.sharding.spec.reduced:
+    raise core.ShardingTypeError(
+        "dynamic_update_slice operand and update must be reduced along the"
+        " same axes. Got operand sharding"
+        f" {operand.str_short(mesh_axis_types=True)} and update sharding"
+        f" {update.str_short(mesh_axis_types=True)}.")
+  return out_s.update(spec=out_s.spec.update(
+      reduced=operand.sharding.spec.reduced))
 
 def _dynamic_update_slice_dtype_rule(operand, update, *start_indices):
   lax.check_same_dtypes("dynamic_update_slice", operand, update)
@@ -1784,7 +1802,8 @@ dynamic_update_slice_p = standard_primitive(
     _dynamic_update_slice_shape_rule, _dynamic_update_slice_dtype_rule,
     'dynamic_update_slice', sharding_rule=_dynamic_update_slice_sharding_rule,
     vma_rule=partial(core.standard_vma_rule, 'dynamic_update_slice'),
-    unreduced_rule=_dynamic_update_slice_unreduced_rule)
+    unreduced_rule=_dynamic_update_slice_unreduced_rule,
+    reduced_rule=_dynamic_update_slice_reduced_rule)
 ad.primitive_jvps[dynamic_update_slice_p] = _dynamic_update_slice_jvp
 ad.primitive_transposes[dynamic_update_slice_p] = \
     _dynamic_update_slice_transpose_rule
@@ -2154,7 +2173,8 @@ def _gather_sharding_rule(operand, indices, *, dimension_numbers,
     raise core.ShardingTypeError(
         "Use `.at[...].get(out_sharding=)` to provide output PartitionSpec for"
         " the gather indexing as out sharding could not be resolved"
-        " unambiguously (or would require collectives on inputs).")
+        " unambiguously (or would require collectives on inputs). Got"
+        f" {operand=}, {indices=}")
   return NamedSharding(out_mesh, out_spec)
 
 def _gather_fill(operand, indices, *, dimension_numbers, slice_sizes,

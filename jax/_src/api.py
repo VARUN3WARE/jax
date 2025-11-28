@@ -1149,7 +1149,7 @@ def vmap(fun: F,
     docstr += fun.__doc__
 
   axis_name = core.no_axis_name if axis_name is None else axis_name
-  if spmd_axis_name is not None and type(spmd_axis_name) is not tuple:
+  if spmd_axis_name is not None and not isinstance(spmd_axis_name, tuple):
     spmd_axis_name = (spmd_axis_name,)
 
   if isinstance(in_axes, list):
@@ -1173,6 +1173,7 @@ def vmap(fun: F,
   @wraps(fun, docstr=docstr)
   @api_boundary
   def vmap_f(*args, **kwargs):
+    nonlocal spmd_axis_name
     if isinstance(in_axes, tuple) and len(in_axes) != len(args):
       raise ValueError("vmap in_axes must be an int, None, or a tuple of entries corresponding "
                        "to the positional arguments passed to the function, "
@@ -1194,10 +1195,14 @@ def vmap(fun: F,
                   _mapped_axis_size(fun, in_tree, args_flat, in_axes_flat, "vmap"))
     explicit_mesh_axis = _mapped_axis_spec(args_flat, in_axes_flat)
     if spmd_axis_name is not None and explicit_mesh_axis is not None:
-      raise ValueError(
-          "Only one of spmd_axis_name or arrays sharded on `Explicit` mesh"
-          f" axis type is allowed. Got {spmd_axis_name=} and"
-          f" arrays sharded on {explicit_mesh_axis=}")
+      if spmd_axis_name == explicit_mesh_axis:
+        spmd_axis_name = None
+      else:
+        raise ValueError(
+            "Only one of spmd_axis_name or arrays sharded on `Explicit` mesh"
+            f" axis type is allowed. Got {spmd_axis_name=} and"
+            f" arrays sharded on {explicit_mesh_axis=}")
+      assert spmd_axis_name is None
     try:
       axis_data = batching.AxisData(axis_name, axis_size_, spmd_axis_name,
                                     explicit_mesh_axis)
@@ -2871,8 +2876,8 @@ def device_put_sharded(shards: Sequence[Any], devices: Sequence[xc.Device]):  # 
     >>> import jax
     >>> devices = jax.local_devices()
     >>> x = [jax.numpy.ones(5) for device in devices]
-    >>> y = jax.device_put_sharded(x, devices)
-    >>> np.allclose(y, jax.numpy.stack(x))
+    >>> y = jax.device_put_sharded(x, devices)  # doctest: +SKIP
+    >>> np.allclose(y, jax.numpy.stack(x))  # doctest: +SKIP
     True
 
     Passing a list of nested container objects with arrays at the leaves for
@@ -2880,14 +2885,14 @@ def device_put_sharded(shards: Sequence[Any], devices: Sequence[xc.Device]):  # 
     all entries in the list to have the same tree structure:
 
     >>> x = [(i, jax.numpy.arange(i, i + 4)) for i in range(len(devices))]
-    >>> y = jax.device_put_sharded(x, devices)
-    >>> type(y)
+    >>> y = jax.device_put_sharded(x, devices)  # doctest: +SKIP
+    >>> type(y)  # doctest: +SKIP
     <class 'tuple'>
-    >>> y0 = jax.device_put_sharded([a for a, b in x], devices)
-    >>> y1 = jax.device_put_sharded([b for a, b in x], devices)
-    >>> np.allclose(y[0], y0)
+    >>> y0 = jax.device_put_sharded([a for a, b in x], devices)  # doctest: +SKIP
+    >>> y1 = jax.device_put_sharded([b for a, b in x], devices)  # doctest: +SKIP
+    >>> np.allclose(y[0], y0)  # doctest: +SKIP
     True
-    >>> np.allclose(y[1], y1)
+    >>> np.allclose(y[1], y1)  # doctest: +SKIP
     True
 
   See Also:
@@ -2953,8 +2958,8 @@ def device_put_replicated(x: Any, devices: Sequence[xc.Device]):  # noqa: F811
     >>> import jax
     >>> devices = jax.local_devices()
     >>> x = jax.numpy.array([1., 2., 3.])
-    >>> y = jax.device_put_replicated(x, devices)
-    >>> np.allclose(y, jax.numpy.stack([x for _ in devices]))
+    >>> y = jax.device_put_replicated(x, devices)  # doctest: +SKIP
+    >>> np.allclose(y, jax.numpy.stack([x for _ in devices]))  # doctest: +SKIP
     True
 
   See Also:

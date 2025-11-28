@@ -852,6 +852,27 @@ ir.MLIRError,
     ):
       self.module.operation.verify()
 
+  def test_custom_primitive_op_results_must_be_scalar_or_vector(self):
+    with ir.InsertionPoint(self.module.body):
+      ref_ty = ir.MemRefType.get((128, 128), ir.F32Type.get())
+      op = mgpu.dialect.CustomPrimitiveOp(
+          result=[ref_ty],
+          operands_=[],
+          in_layouts=[],
+          in_transforms=[],
+          out_layouts=[],
+      )
+      block = op.body.blocks.append()
+      with ir.InsertionPoint(block):
+        [ref] = undefs(ref_ty)
+        mgpu.dialect.ReturnOp(operands_=[ref])
+
+    with self.assertRaisesRegex(
+        ir.MLIRError,
+        r"Custom primitive can only return scalars or vectors.",
+    ):
+      self.module.operation.verify()
+
   def test_tmem_alloc_op_must_have_smem_ref_input(self):
     with ir.InsertionPoint(self.module.body):
       (smem_ptr,) = undefs(
@@ -1086,6 +1107,53 @@ ir.MLIRError,
     ):
       self.module.operation.verify()
 
+  def test_vector_store_op_src_dst_shape_mismatch(self):
+    with ir.InsertionPoint(self.module.body):
+      src_ty = ir.VectorType.get((8,), ir.BF16Type.get())
+      dst_ty = ir.MemRefType.get((4,), ir.BF16Type.get())
+      (src, dst) = undefs(src_ty, dst_ty)
+      mgpu.dialect.vector_store(src, dst)
+    with self.assertRaisesRegex(
+        ir.MLIRError,
+        "The source and destination must have the same shape",
+    ):
+      self.module.operation.verify()
+
+  def test_vector_store_op_src_dst_dtype_mismatch(self):
+    with ir.InsertionPoint(self.module.body):
+      src_ty = ir.VectorType.get((8,), ir.BF16Type.get())
+      dst_ty = ir.MemRefType.get((8,), ir.F32Type.get())
+      (src, dst) = undefs(src_ty, dst_ty)
+      mgpu.dialect.vector_store(src, dst)
+    with self.assertRaisesRegex(
+        ir.MLIRError,
+        "The source and destination must have the same element type",
+    ):
+      self.module.operation.verify()
+
+  def test_broadcasted_iota_op_invalid_dimension(self):
+    with ir.InsertionPoint(self.module.body):
+      ty = ir.VectorType.get((2,), ir.F32Type.get())
+      mgpu.dialect.broadcasted_iota(ty, dimension=2)
+    with self.assertRaisesRegex(
+        ir.MLIRError,
+        "dimension=2 must be smaller than the rank=1 of the result.",
+    ):
+      self.module.operation.verify()
+
+  def test_print_layout_op_invalid_ref(self):
+    with ir.InsertionPoint(self.module.body):
+      ref_ty = ir.MemRefType.get(
+          (2,), ir.F32Type.get(), memory_space=mgpu_utils.smem()
+      )
+      (ref,) = undefs(ref_ty)
+      mgpu.dialect.print_layout("tmem: {}", ref)
+    with self.assertRaisesRegex(
+        ir.MLIRError,
+        "The tmem memref must have a mosaic_gpu.tmem memory space",
+    ):
+      self.module.operation.verify()
+
 
 class DialectLoweringTest(MosaicGpuTest):
 
@@ -1135,17 +1203,17 @@ class DialectLoweringTest(MosaicGpuTest):
     mgpu.lower_mgpu_dialect(self.module, None)
     self.assertTrue(self.module.operation.verify())
 
-    all_mbarrier_init_shared_ops = find_if(
+    all_mbarrier_init_ops = find_if(
         self.module,
-        lambda op: op.name == nvvm.MBarrierInitSharedOp.OPERATION_NAME,
+        lambda op: op.name == nvvm.MBarrierInitOp.OPERATION_NAME,
     )
 
     # One nvvm.mbarrier_init_shared is issued per barrier.
-    self.assertLen(all_mbarrier_init_shared_ops, num_barriers)
+    self.assertLen(all_mbarrier_init_ops, num_barriers)
 
     # Each barrier has its count equal to the arrival count times the
     # warpgroup size.
-    for op in all_mbarrier_init_shared_ops:
+    for op in all_mbarrier_init_ops:
       count = op.count.owner.opview
       self.assertIsInstance(count, arith.ConstantOp)
       self.assertEqual(
@@ -1157,9 +1225,7 @@ class DialectLoweringTest(MosaicGpuTest):
     elt_ty = ir.BF16Type.get()
     with ir.InsertionPoint(self.module.body):
       ref = llvm.mlir_undef(ir.MemRefType.get(shape, elt_ty))
-      zero_index = arith.constant(ir.IndexType.get(), 0)
-      ty = ir.VectorType.get(shape, elt_ty)
-      vector.load(ty, ref, [zero_index, zero_index])
+      mgpu.dialect.vector_load(ref)
     with self.assertRaisesRegex(
         ValueError, "missing a layout and can not be lowered"
     ):
@@ -1170,10 +1236,8 @@ class DialectLoweringTest(MosaicGpuTest):
     elt_ty = ir.BF16Type.get()
     with ir.InsertionPoint(self.module.body):
       ref = llvm.mlir_undef(ir.MemRefType.get(shape, elt_ty))
-      zero_index = arith.constant(ir.IndexType.get(), 0)
-      ty = ir.VectorType.get(shape, elt_ty)
-      load = vector.load(ty, ref, [zero_index, zero_index])
-      strided_layout = mgpu.WGStridedFragLayout.from_shaped_type(ty)
+      load = mgpu.dialect.vector_load(ref)
+      strided_layout = mgpu.WGStridedFragLayout.from_shaped_type(load.type)
       assert strided_layout is not None
       load.owner.attributes["out_layouts"] = ir.ArrayAttr.get([
           layouts.to_layout_attr(strided_layout)
@@ -1218,10 +1282,8 @@ class DialectLoweringTest(MosaicGpuTest):
     elt_ty = ir.BF16Type.get()
     with ir.InsertionPoint(self.module.body):
       ref = llvm.mlir_undef(ir.MemRefType.get(shape, elt_ty))
-      zero_index = arith.constant(ir.IndexType.get(), 0)
-      ty = ir.VectorType.get(shape, elt_ty)
-      reg = vector.load(ty, ref, [zero_index, zero_index])
-      vector.store(reg, ref, [zero_index, zero_index])
+      reg = mgpu.dialect.vector_load(ref)
+      mgpu.dialect.vector_store(reg, ref)
 
     mgpu.infer_layout(self.module)
     mgpu.lower_mgpu_dialect(self.module, None)
@@ -1255,11 +1317,7 @@ class DialectLoweringTest(MosaicGpuTest):
   def test_lowering_for(self):
     shape = (4, 128)
     i32 = ir.IntegerType.get_signless(32)
-    vec_ty = ir.VectorType.get(shape, i32)
     splat_layout_attr = layouts.to_layout_attr(mgpu.WGSplatFragLayout(shape))
-    strided_layout_attr = layouts.to_layout_attr(
-        mgpu.WGStridedFragLayout.from_shaped_type(vec_ty)
-    )
     with ir.InsertionPoint(self.module.body):
       i1 = arith.constant(ir.IndexType.get(), 1)
       c1 = arith.constant(i32, 1)
@@ -1272,8 +1330,10 @@ class DialectLoweringTest(MosaicGpuTest):
       ])
       ptr = llvm.mlir_undef(ir.Type.parse("!llvm.ptr"))
       ref = mgpu_utils.ptr_as_memref(ptr, ir.MemRefType.get(shape, i32))
-      i0 = arith.constant(ir.IndexType.get(), 0)
-      other_vec = vector.LoadOp(vec_ty, ref, [i0, i0])
+      other_vec = mgpu.dialect.VectorLoadOp(ref)
+      strided_layout_attr = layouts.to_layout_attr(
+          mgpu.WGStridedFragLayout.from_shaped_type(other_vec.result.type)
+      )
       other_vec.attributes["out_layouts"] = ir.ArrayAttr.get([strided_layout_attr])
       for_op = scf.ForOp(i1, i1, i1, [c1, splat.result])
       for_op.attributes["in_layouts"] = ir.ArrayAttr.get([strided_layout_attr])
@@ -1392,7 +1452,7 @@ class DialectLoweringTest(MosaicGpuTest):
       error = "transforms for each memref operand in smem"
     else:
       assert omit_out_layouts
-      error = "layout for each result"
+      error = "layout for each vector result"
 
     with self.assertRaisesRegex(ir.MLIRError, error):
       self.module.operation.verify()
@@ -1419,14 +1479,9 @@ class DialectLoweringTest(MosaicGpuTest):
   def test_optimized_gmem_transfers_are_not_supported(self):
     def body(ctx, input, output, scratch):
       del ctx, output, scratch
-      ref_type = ir.MemRefType(input.type)
-      zero = arith.constant(ir.IndexType.get(), 0)
-      zero_indices = [zero] * len(ref_type.shape)
-      vector_type = ir.VectorType.get(ref_type.shape, ref_type.element_type)
-      load = vector.LoadOp(vector_type, input, zero_indices)
-      load.attributes["optimized"] = ir.BoolAttr.get(True)
+      reg = mgpu.dialect.vector_load(input, optimized=True)
       layout = layouts.to_layout_attr(mgpu.WGMMA_LAYOUT)
-      mgpu.dialect.layout_cast(load.result, layout)
+      mgpu.dialect.layout_cast(reg, layout)
 
     shape = (128, 128)
     dtype = jnp.bfloat16

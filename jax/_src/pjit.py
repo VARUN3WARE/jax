@@ -1177,8 +1177,9 @@ def _create_pjit_jaxpr(
       "Finished tracing + transforming {fun_name} for pjit in {elapsed_time:.9f} sec",
       fun_name=fun.__name__, event=dispatch.JAXPR_TRACE_EVENT):
     if config.dynamic_shapes.value:
+      assert isinstance(in_type, core.InputType)
       jaxpr, global_out_avals, consts = pe.trace_to_jaxpr_dynamic2(
-          lu.annotate(fun, cast(core.InputType, in_type)))
+          lu.annotate(fun, in_type))
     else:
       jaxpr, global_out_avals, consts = pe.trace_to_jaxpr_dynamic(fun, in_type)
 
@@ -1832,14 +1833,7 @@ core.custom_typechecks[jit_p] = _pjit_typecheck
 
 
 def _pjit_abstract_eval(*args, jaxpr, out_shardings, **_):
-  # jaxpr input effects are indexed to include jaxpr.constvars, but the pjit eqn
-  # should have effects indexed only on its explicit arguments
-  if jaxpr.constvars:
-    effs = {e.replace(input_index=e.input_index - len(jaxpr.constvars))
-            if isinstance(e, effects.JaxprInputEffect)
-            else e for e in jaxpr.effects}
-  else:
-    effs = jaxpr.effects
+  effs = core.eqn_effects(jaxpr) if jaxpr.constvars else jaxpr.effects
   return jaxpr.out_avals, effs
 jit_p.def_effectful_abstract_eval(_pjit_abstract_eval)
 
@@ -2489,7 +2483,6 @@ def _dce_jaxpr_pjit(
 
 def dce_jaxpr_pjit_rule(used_outputs: list[bool], eqn: core.JaxprEqn
                         ) -> tuple[list[bool], core.JaxprEqn | None]:
-
   if not any(used_outputs) and not pe.has_effects(eqn):
     return [False] * len(eqn.invars), None
 
@@ -2512,10 +2505,11 @@ def dce_jaxpr_pjit_rule(used_outputs: list[bool], eqn: core.JaxprEqn
   if not any(used_inputs) and not any(used_outputs) and not dced_jaxpr.effects:
     return used_inputs, None
   else:
+    new_effs = core.eqn_effects(dced_jaxpr)
     new_eqn = core.new_jaxpr_eqn(
         [v for v, used in zip(eqn.invars, used_inputs) if used],
         [v for v, used in zip(eqn.outvars, used_outputs) if used],
-        eqn.primitive, new_params, dced_jaxpr.effects, eqn.source_info, eqn.ctx)
+        eqn.primitive, new_params, new_effs, eqn.source_info, eqn.ctx)
     return used_inputs, new_eqn
 
 pe.dce_rules[jit_p] = dce_jaxpr_pjit_rule

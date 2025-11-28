@@ -16,7 +16,6 @@ limitations under the License.
 #ifndef JAXLIB_PY_EXECUTABLE_H_
 #define JAXLIB_PY_EXECUTABLE_H_
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -27,8 +26,10 @@ limitations under the License.
 #include <variant>
 #include <vector>
 
+#include "absl/container/flat_hash_map.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/synchronization/mutex.h"
 #include "llvm/Support/Casting.h"
 #include "nanobind/nanobind.h"
 #include "jaxlib/nb_class_ptr.h"
@@ -61,6 +62,8 @@ class PyToken {
 
   absl::Status Await();
 
+  static void Register(nanobind::module_& m);
+
  private:
   xla::Future<> future_;
 };
@@ -79,6 +82,8 @@ class PyShardedToken {
   }
 
   absl::Status Await();
+
+  static void Register(nanobind::module_& m);
 
  private:
   std::vector<xla::Future<>> futures_;
@@ -110,6 +115,8 @@ class PyExecuteResults {
   }
 
   void CheckNotDisassembled() const;
+
+  static void Register(nanobind::module_& m);
 
  private:
   bool is_exploded_ = false;
@@ -165,6 +172,8 @@ class PyExecutable {
   absl::StatusOr<xla::ifrt::AttributeMap> GetCostAnalysis() const {
     return ifrt_executable_->GetCostAnalysis();
   }
+
+  static void Register(nanobind::module_& m);
 
  private:
   xla::ifrt::ExecutableRef ifrt_executable_;
@@ -264,6 +273,8 @@ class PyLoadedExecutable {
   // Keep `obj` alive as long as PyLoadedExecutable.
   void KeepAlive(nanobind::object obj);
 
+  static void Register(nanobind::module_& m);
+
  private:
   friend class PyClient;
 
@@ -276,7 +287,10 @@ class PyLoadedExecutable {
   std::optional<std::string> fingerprint_;
 
   // Launch ID to use for the next execution.
-  std::atomic<uint32_t> next_launch_id_;
+  const uint64_t launch_id_key_;
+
+  static absl::Mutex next_launch_id_mutex_;
+  static absl::flat_hash_map<uint64_t, uint32_t>* next_launch_id_;
 
   // The options to pass to `executable_.Execute`.
   xla::ifrt::ExecuteOptions options_;
